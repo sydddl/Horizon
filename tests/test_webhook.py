@@ -269,6 +269,24 @@ class TestWebhookPreview:
         assert "<details>" not in preview["body"]
         del os.environ[_TEST_URL_ENV]
 
+    def test_build_preview_uses_request_body_override(self):
+        os.environ[_TEST_URL_ENV] = _TEST_URL
+        config = WebhookConfig(
+            enabled=True,
+            url_env=_TEST_URL_ENV,
+            request_body={"content": "configured"},
+        )
+        notifier = WebhookNotifier(config)
+
+        preview = notifier.build_preview({
+            "_request_body_override": {"content": "override"},
+        })
+
+        parsed = json.loads(preview["body"])
+        assert parsed["content"] == "override"
+        assert preview["headers"]["Content-Type"] == "application/json"
+        del os.environ[_TEST_URL_ENV]
+
 
 # ── JSON prefix detection ──
 
@@ -643,6 +661,10 @@ class TestWebhookConfigModel:
         assert config.url_env is None
         assert config.request_body is None
         assert config.headers is None
+        assert config.delivery == "summary"
+        assert config.platform == "generic"
+        assert config.layout == "markdown"
+        assert config.fallback_layout == "markdown"
 
     def test_full_config(self):
         config = WebhookConfig(
@@ -651,11 +673,19 @@ class TestWebhookConfigModel:
             request_body='{"msg_type":"post"}',
             headers="Authorization: Bearer xxx",
             delivery="summary_and_items",
+            overview_position="last",
+            platform="feishu",
+            layout="collapsible",
+            fallback_layout="markdown",
             languages=["zh"],
         )
         assert config.enabled is True
         assert config.url_env == "HORIZON_WEBHOOK_URL"
         assert config.delivery == "summary_and_items"
+        assert config.overview_position == "last"
+        assert config.platform == "feishu"
+        assert config.layout == "collapsible"
+        assert config.fallback_layout == "markdown"
         assert config.languages == ["zh"]
 
 
@@ -784,6 +814,86 @@ class TestSendDailySummary:
             assert item2_vars["message_kind"] == "item"
             assert item2_vars["item_index"] == 2
             assert item2_vars["item_url"] == "https://example.com/b"
+        del os.environ[_TEST_URL_ENV]
+
+    def test_summary_and_items_overview_last_sends_reversed_items_then_overview(self):
+        """overview_position='last' keeps overview as newest chat message."""
+        os.environ[_TEST_URL_ENV] = _TEST_URL
+        config = WebhookConfig(
+            enabled=True,
+            url_env=_TEST_URL_ENV,
+            delivery="summary_and_items",
+            overview_position="last",
+        )
+        notifier = WebhookNotifier(config)
+        summarizer = DailySummarizer()
+        items = [_make_item(title="Item A"), _make_item(title="Item B", url="https://example.com/b")]
+
+        with patch.object(notifier, "notify", new_callable=AsyncMock) as mock_notify:
+            _run_async(notifier.send_daily_summary(
+                summary="# Full summary",
+                important_items=items,
+                all_items_count=20,
+                date="2026-04-24",
+                lang="en",
+                summarizer=summarizer,
+            ))
+
+            assert mock_notify.call_count == 3
+
+            first_vars = mock_notify.call_args_list[0][0][0]
+            second_vars = mock_notify.call_args_list[1][0][0]
+            third_vars = mock_notify.call_args_list[2][0][0]
+
+            assert first_vars["message_kind"] == "item"
+            assert first_vars["item_index"] == 2
+            assert first_vars["item_url"] == "https://example.com/b"
+            assert second_vars["message_kind"] == "item"
+            assert second_vars["item_index"] == 1
+            assert second_vars["item_url"] == "https://example.com/test"
+            assert third_vars["message_kind"] == "overview"
+            assert third_vars["message_title"] == "Horizon 2026-04-24 Overview"
+        del os.environ[_TEST_URL_ENV]
+
+    def test_feishu_collapsible_layout_builds_single_card_message(self):
+        """Feishu collapsible layout sends one card with collapsed item panels."""
+        os.environ[_TEST_URL_ENV] = _TEST_URL
+        config = WebhookConfig(
+            enabled=True,
+            url_env=_TEST_URL_ENV,
+            delivery="summary_and_items",
+            platform="feishu",
+            layout="collapsible",
+        )
+        notifier = WebhookNotifier(config)
+        summarizer = DailySummarizer()
+        items = [_make_item(title="Item A"), _make_item(title="Item B", url="https://example.com/b")]
+
+        messages = notifier.build_daily_summary_messages(
+            summary="# Full summary",
+            important_items=items,
+            all_items_count=20,
+            date="2026-04-24",
+            lang="en",
+            summarizer=summarizer,
+        )
+
+        assert len(messages) == 1
+        assert messages[0]["message_kind"] == "collapsible"
+
+        body = messages[0]["_request_body_override"]
+        assert body["msg_type"] == "interactive"
+        assert body["card"]["schema"] == "2.0"
+
+        elements = body["card"]["body"]["elements"]
+        assert "Expand the panels below" in elements[0]["content"]
+        assert "Item A" not in elements[0]["content"]
+        panels = [element for element in elements if element["tag"] == "collapsible_panel"]
+        assert len(panels) == 2
+        assert panels[0]["expanded"] is False
+        assert panels[0]["header"]["title"]["content"].startswith("1. Item A")
+        assert "Item 1/2" in panels[0]["elements"][0]["content"]
+        assert panels[1]["header"]["title"]["content"].startswith("2. Item B")
         del os.environ[_TEST_URL_ENV]
 
     def test_language_filter_skips_non_matching_lang(self):

@@ -83,6 +83,10 @@
     "enabled": false,
     "url_env": "HORIZON_WEBHOOK_URL",
     "delivery": "summary",
+    "overview_position": "first",
+    "platform": "generic",
+    "layout": "markdown",
+    "fallback_layout": "markdown",
     "languages": null,
     "request_body": {
       "msg_type": "interactive",

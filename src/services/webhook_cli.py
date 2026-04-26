@@ -94,6 +94,8 @@ async def _run_test(webhook_config, lang: str, dry_run: bool, delivery_override:
         console.print(f"  [cyan]Webhook enabled:[/cyan] {effective_config.enabled}")
         console.print(f"  [cyan]URL env var:[/cyan] {effective_config.url_env}")
         console.print(f"  [cyan]Delivery mode:[/cyan] {effective_config.delivery}")
+        console.print(f"  [cyan]Platform:[/cyan] {effective_config.platform}")
+        console.print(f"  [cyan]Layout:[/cyan] {effective_config.layout}")
 
         messages = notifier.build_daily_summary_messages(
             summary=summary,

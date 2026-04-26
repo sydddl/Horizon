@@ -173,6 +173,41 @@ def _isjson(s: str) -> bool:
     return s.startswith("{") or s.startswith("[")
 
 
+def _is_feishu_platform(platform: str) -> bool:
+    """Return whether platform should use Feishu/Lark card rendering."""
+    return platform.lower() in {"feishu", "lark"}
+
+
+def _text(value: str) -> dict[str, str]:
+    """Build a Feishu plain text object."""
+    return {"tag": "plain_text", "content": value}
+
+
+def _markdown(content: str) -> dict[str, str]:
+    """Build a Feishu Markdown component."""
+    return {"tag": "markdown", "content": content}
+
+
+def _collapsible_panel(title: str, content: str) -> dict[str, Any]:
+    """Build a Feishu Card JSON 2.0 collapsible panel."""
+    return {
+        "tag": "collapsible_panel",
+        "expanded": False,
+        "header": {
+            "title": _text(title),
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "size": "16px 16px",
+            },
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
+        "border": {"color": "grey", "corner_radius": "5px"},
+        "elements": [_markdown(content)],
+    }
+
+
 def _extract_headers(headers_str: Optional[str]) -> dict:
     """Parse custom headers from a multi-line "Key: Value" string.
 
@@ -224,7 +259,7 @@ class WebhookNotifier:
 
         content_type = "application/x-www-form-urlencoded"
         body_content = None
-        raw_body = self.config.request_body
+        raw_body = variables.get("_request_body_override", self.config.request_body)
         body_variables = _prepare_variables_for_body(raw_body, variables)
 
         if raw_body:
@@ -245,6 +280,100 @@ class WebhookNotifier:
         headers = _extract_headers(self.config.headers)
         headers["Content-Type"] = content_type
         return request_url, body_content, headers
+
+    def _can_use_feishu_collapsible(self) -> bool:
+        """Return whether this notifier should render Feishu collapsible cards."""
+        platform = getattr(self.config, "platform", "generic")
+        layout = getattr(self.config, "layout", "markdown")
+        return _is_feishu_platform(platform) and layout == "collapsible"
+
+    def _build_feishu_collapsible_overview(
+        self,
+        item_count: int,
+        all_items_count: int,
+        date: str,
+        lang: str,
+    ) -> str:
+        """Build a non-redundant overview for a card that already lists item panels."""
+        if lang == "zh":
+            if item_count == 0:
+                return (
+                    f"# Horizon 每日速递 - {date}\n\n"
+                    f"> 已分析 {all_items_count} 条内容，暂无达到重要性阈值的资讯。"
+                )
+            return (
+                f"# Horizon 每日速递 - {date}\n\n"
+                f"> 从 {all_items_count} 条内容中筛选出 {item_count} 条重要资讯。\n\n"
+                "点击下方新闻面板即可在飞书内展开阅读全文。"
+            )
+
+        if item_count == 0:
+            return (
+                f"# Horizon Daily - {date}\n\n"
+                f"> Analyzed {all_items_count} items, but none met the importance threshold."
+            )
+
+        return (
+            f"# Horizon Daily - {date}\n\n"
+            f"> Selected {item_count} important items from {all_items_count} fetched items.\n\n"
+            "Expand the panels below to read the full briefing inside Feishu/Lark."
+        )
+
+    def _build_feishu_collapsible_body(
+        self,
+        important_items: List[ContentItem],
+        all_items_count: int,
+        date: str,
+        lang: str,
+        summarizer: DailySummarizer,
+    ) -> dict[str, Any]:
+        """Build a single Feishu Card JSON 2.0 message with collapsed item details."""
+        overview = self._build_feishu_collapsible_overview(
+            item_count=len(important_items),
+            all_items_count=all_items_count,
+            date=date,
+            lang=lang,
+        )
+        elements: list[dict[str, Any]] = [_markdown(overview)]
+
+        for item_index, item in enumerate(important_items, start=1):
+            title = str(item.metadata.get(f"title_{lang}") or item.title)
+            score = item.ai_score or "?"
+            panel_title = f"{item_index}. {title} ⭐️ {score}/10"
+            item_content = summarizer.generate_webhook_item(
+                item,
+                language=lang,
+                index=item_index,
+                total=len(important_items),
+            )
+            elements.append(_collapsible_panel(
+                panel_title,
+                _format_markdown_for_webhook(item_content),
+            ))
+
+        return {
+            "msg_type": "interactive",
+            "card": {
+                "schema": "2.0",
+                "config": {
+                    "wide_screen_mode": True,
+                    "update_multi": True,
+                },
+                "header": {
+                    "title": {
+                        "tag": "plain_text",
+                        "content": (
+                            f"Horizon {date} 折叠日报" if lang == "zh"
+                            else f"Horizon {date} Collapsible Daily"
+                        ),
+                    },
+                    "template": "blue",
+                },
+                "body": {
+                    "elements": elements,
+                },
+            },
+        }
 
     def build_preview(self, variables: dict) -> dict[str, Any]:
         """Build the fully rendered request for dry-run preview."""
@@ -278,13 +407,36 @@ class WebhookNotifier:
             "timestamp": str(int(datetime.now(timezone.utc).timestamp())),
         }
 
+        if self._can_use_feishu_collapsible():
+            return [{
+                **base_vars,
+                "message_title": (
+                    f"Horizon {date} 折叠日报" if lang == "zh"
+                    else f"Horizon {date} Collapsible Daily"
+                ),
+                "message_kind": "collapsible",
+                "summary": self._build_feishu_collapsible_overview(
+                    item_count=len(important_items),
+                    all_items_count=all_items_count,
+                    date=date,
+                    lang=lang,
+                ),
+                "_request_body_override": self._build_feishu_collapsible_body(
+                    important_items=important_items,
+                    all_items_count=all_items_count,
+                    date=date,
+                    lang=lang,
+                    summarizer=summarizer,
+                ),
+            }]
+
         delivery = getattr(self.config, "delivery", "summary")
         if delivery == "summary_and_items":
-            messages: List[dict[str, Any]] = []
+            item_messages: List[dict[str, Any]] = []
             overview = summarizer.generate_webhook_overview(
                 important_items, date, all_items_count, language=lang,
             )
-            messages.append({
+            overview_message = {
                 **base_vars,
                 "message_title": (
                     f"Horizon {date} 总览" if lang == "zh"
@@ -292,14 +444,14 @@ class WebhookNotifier:
                 ),
                 "message_kind": "overview",
                 "summary": overview,
-            })
+            }
             for item_index, item in enumerate(important_items, start=1):
                 title = str(item.metadata.get(f"title_{lang}") or item.title)
                 item_summary = summarizer.generate_webhook_item(
                     item, language=lang, index=item_index,
                     total=len(important_items),
                 )
-                messages.append({
+                item_messages.append({
                     **base_vars,
                     "message_title": f"{item_index}/{len(important_items)} {title}",
                     "message_kind": "item",
@@ -310,7 +462,11 @@ class WebhookNotifier:
                     "item_score": item.ai_score or "",
                     "summary": item_summary,
                 })
-            return messages
+
+            if getattr(self.config, "overview_position", "first") == "last":
+                return list(reversed(item_messages)) + [overview_message]
+
+            return [overview_message] + item_messages
 
         return [{
             **base_vars,
